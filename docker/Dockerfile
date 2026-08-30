@@ -21,5 +21,8 @@ RUN apt-get update && \
 RUN groupmod -g ${POSTGRES_GID} postgres && \
     usermod -u ${POSTGRES_UID} -g ${POSTGRES_GID} postgres
 
+# 默认数据目录改用包管理器标准的 main 路径（对齐 pg_ctlcluster 布局），替代镜像默认的 docker 路径
+ENV PGDATA /var/lib/postgresql/$PG_MAJOR/main
+
 CMD ["postgres", "-c" ,"shared_preload_libraries=vchord,vector"]
 
