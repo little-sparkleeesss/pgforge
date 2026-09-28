@@ -9,8 +9,13 @@ on:
         description: VectorChord release version (e.g. 1.1.1)
         required: false
         default: "1.1.1"
+  schedule:
+    # 每周一 07:21 UTC 跑完整流程：重建并推送镜像，同时跑上游漂移检查。
+    # 版本号和基础镜像都是浮动的，定期重建才拿得到安全更新，别再加 if 把构建挡掉。
+    - cron: "21 7 * * 1"
 
 env:
+  PG_MAJOR: "18"
   # push 触发时 inputs 为空，回退到默认版本；手动触发可覆盖
   VCHORD_VERSION: ${{ inputs.vchord_version || '1.1.1' }}
 
@@ -18,16 +23,30 @@ permissions:
   contents: read
   packages: write
 
-concurrency:
-  group: build-postgres
-  cancel-in-progress: true
-
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
+    # 原先放在 workflow 层的 concurrency 挪到 job 层：
+    # 否则每周的定时检查会触发 cancel-in-progress，把正在跑的构建掐掉
+    concurrency:
+      group: build-postgres
+      cancel-in-progress: true
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+
+      # 以 postgres:${PG_MAJOR} 实际基于的系统为准决定运行时 base，
+      # 保证「取上游文件的镜像」和「运行时 base」永远是同一个 Debian 代号，
+      # 不用再手工跟着上游切变体。
+      - name: 从上游镜像推导 Debian 代号
+        id: suite
+        run: |
+          docker pull --quiet "postgres:${PG_MAJOR}" > /dev/null
+          suite=$(docker run --rm --entrypoint sh "postgres:${PG_MAJOR}" -c \
+            '. /etc/os-release && echo "$VERSION_CODENAME"')
+          [ -n "$suite" ] || { echo "::error::没能从 postgres:${PG_MAJOR} 读出 Debian 代号"; exit 1; }
+          echo "suite=$suite" >> "$GITHUB_OUTPUT"
+          echo "postgres:${PG_MAJOR} 基于 Debian ${suite} → 运行时 base 用 debian:${suite}-slim"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
@@ -60,5 +79,87 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
             VCHORD=${{ env.VCHORD_VERSION }}
+            PG_MAJOR=${{ env.PG_MAJOR }}
+            DEBIAN_SUITE=${{ steps.suite.outputs.suite }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  # docker/Dockerfile 从 debian-slim 自建基础镜像，其中有几处是手工复刻上游
+  # docker-library/postgres 的 <PG_MAJOR>/<Debian 代号>/Dockerfile 的行为（不装 jit、不用上游的 PGDATA）。
+  # entrypoint / gosu / keyring 那些是 COPY --from=postgres:${PG_MAJOR}-${DEBIAN_SUITE} 拿的，上游改了自动跟；
+  # 但下面这些是手写的，上游一变就会静默分叉，所以定期比对一次。
+  # 这个 job 独立于构建，失败不会挡住镜像构建，只是把问题暴露出来。
+  check-upstream-drift:
+    runs-on: ubuntu-latest
+    concurrency:
+      group: check-upstream-drift
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v7
+
+      # 与构建 job 用同一套推导，保证这里判断的就是构建实际会用的东西
+      # PG_MAJOR 不再在这里写死：workflow 层的 env 会作为环境变量注入所有 step，
+      # 脚本里直接用 $PG_MAJOR，升主版本时只改 workflow 顶部那一处。
+      - name: 推导 postgres:${PG_MAJOR} 当前基于的 Debian 代号
+        id: suite
+        run: |
+          docker pull --quiet "postgres:${PG_MAJOR}" > /dev/null
+          suite=$(docker run --rm --entrypoint sh "postgres:${PG_MAJOR}" -c \
+            '. /etc/os-release && echo "$VERSION_CODENAME"')
+          [ -n "$suite" ] || { echo "::error::没能从 postgres:${PG_MAJOR} 读出 Debian 代号"; exit 1; }
+          echo "suite=$suite" >> "$GITHUB_OUTPUT"
+          echo "上游 postgres:${PG_MAJOR} 现在基于：Debian $suite"
+
+      - name: 上游换过 base 就提醒（会连带换 glibc）
+        env:
+          SUITE: ${{ steps.suite.outputs.suite }}
+        run: |
+          recorded=$(sed -nE 's/^ARG DEBIAN_SUITE=(.*)$/\1/p' docker/Dockerfile | head -1)
+          echo "docker/Dockerfile 里记的默认值是：${recorded}（CI 构建不读它，只是个记录）"
+          if [ "$recorded" != "$SUITE" ]; then
+            echo "::warning::上游 base 变了：记录的是 ${recorded}，现在是 $SUITE。"
+            echo "CI 构建会自动跟着上游走（这是有意设计）。注意 glibc 随之变化，既有文本索引可能受影响，"
+            echo "按 REINDEX / REFRESH COLLATION 流程处理；顺手把 Dockerfile 里的默认值也改成新代号保持一致。"
+          else
+            echo "与记录一致，base 没有变。"
+          fi
+
+      - name: 抓上游 Dockerfile
+        env:
+          SUITE: ${{ steps.suite.outputs.suite }}
+        run: |
+          curl -fsSL -o upstream.Dockerfile \
+            "https://raw.githubusercontent.com/docker-library/postgres/master/${PG_MAJOR}/${SUITE}/Dockerfile"
+          echo "已获取上游 ${PG_MAJOR}/$SUITE/Dockerfile：$(wc -l < upstream.Dockerfile) 行，sha256=$(sha256sum upstream.Dockerfile | cut -c1-16)"
+
+      - name: 校验我们复刻的那些行为是否还在
+        run: |
+          set -u
+          fail=0
+          while IFS='|' read -r desc pat; do
+            [ -z "${desc:-}" ] && continue
+            if grep -qF -- "$pat" upstream.Dockerfile; then
+              echo "  OK    $desc"
+            else
+              echo "  DRIFT $desc"
+              echo "        上游文件里已找不到: $pat"
+              fail=1
+            fi
+          done <<'CHECKS'
+          关闭自动建主集群（决定 PGDATA 行为）|create_main_cluster) .*$/\1 = false
+          postgresql.conf.sample 重定向|dpkg-divert --add --rename --divert "/usr/share/postgresql/postgresql.conf.sample.dpkg"
+          listen_addresses 默认放开|^#?(listen_addresses)
+          postgres 组 gid=999（对应 POSTGRES_GID）|groupadd -r postgres --gid=999
+          postgres 用户 uid=999（对应 POSTGRES_UID）|useradd -r -g postgres --uid=999
+          PGDG keyring 路径（我们 COPY 它）|/usr/local/share/keyrings/postgres.gpg.asc
+          initdb 初始化脚本目录|mkdir /docker-entrypoint-initdb.d
+          /var/run/postgresql 权限|mode 3777 /var/run/postgresql
+          /var/lib/postgresql 权限|mode 1777 /var/lib/postgresql
+          en_US.UTF-8 生成|echo 'en_US.UTF-8 UTF-8' >> /etc/locale.gen
+          docker-enforce-initdb.sh（我们 COPY 它）|docker-enforce-initdb.sh
+          CHECKS
+          if [ "$fail" -ne 0 ]; then
+            echo "::error::上游 Dockerfile 有变动，上面标 DRIFT 的项需要人工核对 docker/Dockerfile 的对应部分"
+            exit 1
+          fi
+          echo "全部一致：我们复刻的上游行为没有漂移。"
