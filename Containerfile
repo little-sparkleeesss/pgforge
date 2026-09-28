@@ -7,7 +7,7 @@ ARG PG_MAJOR=18
 # 会静默把另一个发行版编的包装进来。
 #
 # CI 会拉 postgres:${PG_MAJOR} 读出它实际基于哪个代号，然后作为 build-arg 传进来，
-# 所以正常构建不用管这个默认值——它只用于本地直接 docker build。
+# 所以正常构建不用管这个默认值——它只用于本地直接构建（docker build / podman build）。
 # 本地构建想和 CI 结果一致，就把它改成 postgres:${PG_MAJOR} 当前用的那个代号。
 #
 # 注意：跟上游走意味着 base 的 glibc 也跟着变（bookworm 2.36 → trixie 2.41）。
@@ -65,7 +65,7 @@ RUN set -eux; \
     pgdg_suite="$(sed -nE 's|.*/apt ([a-z]+)-pgdg .*|\1|p' /etc/apt/sources.list.d/pgdg.list | head -1)"; \
     if [ -z "$os_suite" ] || [ "$os_suite" != "$pgdg_suite" ]; then \
         echo "底层系统是 '${os_suite}'，但 COPY 自上游的 PGDG 源指向 '${pgdg_suite}-pgdg'。"; \
-        echo "两个 FROM 必须用同一个 Debian 代号，检查 Dockerfile 顶部的 ARG DEBIAN_SUITE。"; \
+        echo "两个 FROM 必须用同一个 Debian 代号，检查 Containerfile 顶部的 ARG DEBIAN_SUITE。"; \
         exit 1; \
     fi; \
     apt-get update; \

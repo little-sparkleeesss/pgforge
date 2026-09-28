@@ -71,8 +71,8 @@ jobs:
       - name: Build and push
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
-          context: ./docker
-          file: ./docker/Dockerfile
+          context: .
+          file: ./Containerfile
           platforms: linux/amd64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
@@ -84,7 +84,7 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-  # docker/Dockerfile 从 debian-slim 自建基础镜像，其中有几处是手工复刻上游
+  # Containerfile 从 debian-slim 自建基础镜像，其中有几处是手工复刻上游
   # docker-library/postgres 的 <PG_MAJOR>/<Debian 代号>/Dockerfile 的行为（不装 jit、不用上游的 PGDATA）。
   # entrypoint / gosu / keyring 那些是 COPY --from=postgres:${PG_MAJOR}-${DEBIAN_SUITE} 拿的，上游改了自动跟；
   # 但下面这些是手写的，上游一变就会静默分叉，所以定期比对一次。
@@ -114,8 +114,8 @@ jobs:
         env:
           SUITE: ${{ steps.suite.outputs.suite }}
         run: |
-          recorded=$(sed -nE 's/^ARG DEBIAN_SUITE=(.*)$/\1/p' docker/Dockerfile | head -1)
-          echo "docker/Dockerfile 里记的默认值是：${recorded}（CI 构建不读它，只是个记录）"
+          recorded=$(sed -nE 's/^ARG DEBIAN_SUITE=(.*)$/\1/p' Containerfile | head -1)
+          echo "Containerfile 里记的默认值是：${recorded}（CI 构建不读它，只是个记录）"
           if [ "$recorded" != "$SUITE" ]; then
             echo "::warning::上游 base 变了：记录的是 ${recorded}，现在是 $SUITE。"
             echo "CI 构建会自动跟着上游走（这是有意设计）。注意 glibc 随之变化，既有文本索引可能受影响，"
@@ -159,7 +159,7 @@ jobs:
           docker-enforce-initdb.sh（我们 COPY 它）|docker-enforce-initdb.sh
           CHECKS
           if [ "$fail" -ne 0 ]; then
-            echo "::error::上游 Dockerfile 有变动，上面标 DRIFT 的项需要人工核对 docker/Dockerfile 的对应部分"
+            echo "::error::上游 Dockerfile 有变动，上面标 DRIFT 的项需要人工核对 Containerfile 的对应部分"
             exit 1
           fi
           echo "全部一致：我们复刻的上游行为没有漂移。"
